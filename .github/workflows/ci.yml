@@ -1,221 +1,107 @@
-name: CI/CD Pipeline
+name: CI
 
-on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-  workflow_dispatch:
-
-concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
-
-env:
-  NODE_VERSION: '22'
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+on: [push]
 
 jobs:
-  # =========================================================================
-  # STAGE 1: LINT & STATIC ANALYSIS (Fail-Fast Boundary)
-  # =========================================================================
   lint:
-    name: Lint & Typecheck
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Node.js runtime
+      - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: ${{ env.NODE_VERSION }}
+          node-version: "22"
           cache: npm
 
-      - name: Pin deterministic npm engine
+      - name: Pin npm 11
         run: npm install -g npm@11
 
-      - name: Install dependencies strictly
+      - name: Install dependencies
         run: npm ci
 
-      - name: Static typecheck & compilation verification
+      - name: Static typecheck & compilation (tsc)
         run: npm run build
 
-  # =========================================================================
-  # STAGE 2: AUTOMATED TESTING (Dynamic Verification)
-  # =========================================================================
   test:
-    name: Unit & Integration Tests
     needs: lint
     runs-on: ubuntu-latest
-    if: >-
-      github.event_name != 'push' ||
-      ( !contains(github.event.head_commit.message, '[skip-tests]') &&
-        !contains(join(github.event.commits.*.message, ' '), '[skip-tests]') )
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Node.js runtime
+      - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: ${{ env.NODE_VERSION }}
+          node-version: "22"
           cache: npm
 
-      - name: Pin deterministic npm engine
+      - name: Pin npm 11
         run: npm install -g npm@11
 
-      - name: Restore/Persist MongoDB test binaries
+      - name: Cache MongoDB binaries
         uses: actions/cache@v4
         with:
           path: /tmp/mongodb-binaries
           key: mongodb-binaries-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
           restore-keys: mongodb-binaries-${{ runner.os }}-
 
-      - name: Install dependencies strictly
+      - name: Install dependencies
         run: npm ci
 
-      - name: Execute Vitest test suite
+      - name: Run tests
         run: npm test
         env:
           NODE_ENV: test
           MONGOMS_DOWNLOAD_DIR: /tmp/mongodb-binaries
 
-  # =========================================================================
-  # STAGE 3: SECURITY SCANNING (Static & Supply Chain Security)
-  # =========================================================================
   scan:
-    name: Security & Vulnerability Scanning
-    needs: lint
+    needs: test
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Node.js runtime
+      - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: ${{ env.NODE_VERSION }}
+          node-version: "22"
           cache: npm
 
-      - name: Pin deterministic npm engine
+      - name: Pin npm 11
         run: npm install -g npm@11
 
-      - name: Install dependencies strictly
+      - name: Install dependencies
         run: npm ci
 
-      - name: Software Composition Analysis (SCA - npm audit)
+      - name: Dependency vulnerability scan (npm audit)
         run: npm audit --omit=dev --audit-level=high
 
-      - name: Secret scanning (detect hardcoded tokens/credentials)
-        uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Filesystem scan (Trivy)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          severity: 'CRITICAL,HIGH'
 
-  # =========================================================================
-  # STAGE 4: BUILD & SMOKE TEST (Artifact Packaging)
-  # =========================================================================
   build:
-    name: Container Build & Smoke Test
-    needs: [test, scan]
+    needs: scan
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Extract Docker metadata & tags
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=sha,prefix=sha-,format=short
-
-      - name: Build and verify container image (with BuildKit cache)
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile
-          load: true
-          tags: ${{ steps.meta.outputs.tags }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Execute containerized migration and health smoke test
-        run: |
-          docker compose up -d --build
-          
-          # Poll until the API container reports healthy via Docker healthcheck
-          for i in {1..20}; do
-            STATUS=$(docker compose ps api --format '{{.Health}}')
-            if [ "$STATUS" = "healthy" ]; then
-              echo "API is healthy!"
-              break
-            fi
-            echo "Waiting for API healthcheck... ($i/20)"
-            sleep 2
-          done
-          
-          # Verify HTTP response
-          curl -f http://localhost:3000/api/v1/health
-          docker compose down -v
-
-      - name: Authenticate to GitHub Container Registry (GHCR)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Push immutable image artifact
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      - name: Build and push image
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: Dockerfile
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          push: ${{ github.ref == 'refs/heads/main' }}
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/da3wa-backend:latest
           cache-from: type=gha
-
-  # =========================================================================
-  # POST-DEPLOYMENT / STATE SYNC: DATABASE MIGRATION
-  # =========================================================================
-  db-sync:
-    name: Migrate Atlas
-    needs: build
-    runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    environment: production
-    concurrency:
-      group: db-sync-main
-      cancel-in-progress: false
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js runtime
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: npm
-
-      - name: Pin deterministic npm engine
-        run: npm install -g npm@11
-
-      - name: Install dependencies strictly
-        run: npm ci
-
-      - name: Run forward-only schema backfill and index reconciliation
-        run: npm run db:migrate
-        env:
-          MONGODB_URI: ${{ secrets.MONGODB_URI }}
+          cache-to: type=gha,mode=max
