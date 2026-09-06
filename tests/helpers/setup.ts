@@ -2,6 +2,9 @@ import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
 import { resetEnvCache } from '../../src/config/env';
 
+// Cache downloaded mongod binaries across local and CI test runs
+process.env.MONGOMS_DOWNLOAD_DIR = process.env.MONGOMS_DOWNLOAD_DIR || '/tmp/mongodb-binaries';
+
 let mongoServer: MongoMemoryServer;
 
 export const testEnv = {
@@ -35,12 +38,25 @@ export async function setupTestDatabase(): Promise<string> {
 }
 
 export async function teardownTestDatabase(): Promise<void> {
-  await mongoose.connection.dropDatabase();
-  await mongoose.disconnect();
+  if (mongoose.connection.readyState !== 0) {
+    if (mongoose.connection.db) {
+      await mongoose.connection.dropDatabase();
+    }
+    await mongoose.disconnect();
+  }
   if (mongoServer) {
     await mongoServer.stop();
   }
   resetEnvCache();
+}
+
+export async function clearDatabase(): Promise<void> {
+  if (mongoose.connection.readyState !== 0 && mongoose.connection.db) {
+    const collections = await mongoose.connection.db.collections();
+    for (const collection of collections) {
+      await collection.deleteMany({});
+    }
+  }
 }
 
 export function parseSetCookies(
