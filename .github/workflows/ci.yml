@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# A newer push to main supersedes an in-flight run for the same branch.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+
+    # Escape hatch: put [skip-tests] anywhere in a commit message and this job
+    # is skipped. `head_commit` covers squash- and merge-commit messages;
+    # `commits.*.message` covers every individual commit carried by the push,
+    # so the marker works wherever it was written. Manual runs always test.
+    if: >-
+      github.event_name != 'push' ||
+      ( !contains(github.event.head_commit.message, '[skip-tests]') &&
+        !contains(join(github.event.commits.*.message, ' '), '[skip-tests]') )
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Node 26 matches local development and, crucially, ships npm 11 — the
+      # npm major that generated package-lock.json. npm 10 (bundled with Node
+      # 22) resolves mongodb's unsatisfiable optional peer dep on
+      # gcp-metadata@^7 differently and rejects the lockfile as out of sync.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26
+          cache: npm
+
+      # Belt and braces: don't leave the npm major to whatever the Node release
+      # happens to bundle, since that is what broke `npm ci` before.
+      - name: Pin npm
+        run: npm install -g npm@11
+
+      # mongodb-memory-server downloads a mongod binary on first use; caching it
+      # keeps every run after the first from re-fetching ~100MB.
+      - name: Cache MongoDB binaries
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/mongodb-binaries
+          key: mongodb-binaries-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: mongodb-binaries-${{ runner.os }}-
+
+      - run: npm ci
+
+      - name: Typecheck
+        run: npm run build
+
+      - name: Test
+        run: npm test
+        # The suite supplies its own env via tests/helpers/setup.ts and runs
+        # MongoDB in memory, so no secrets are needed here.
+        env:
+          NODE_ENV: test
+
+  db-sync:
+    name: Migrate Atlas
+    needs: test
+    runs-on: ubuntu-latest
+
+    # Only main, and never on top of a red build. `always()` is what lets a
+    # [skip-tests] push through: `needs` alone would skip this job whenever the
+    # test job was skipped, so the two outcomes are spelled out instead.
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      always() &&
+      ( needs.test.result == 'success' || needs.test.result == 'skipped' )
+
+    # Named so the cluster credential can be scoped to it, and optionally put
+    # behind a required reviewer in the repo's environment settings.
+    environment: production
+
+    # Deliberately not part of the CI concurrency group above: a schema sync
+    # must never be cancelled halfway through by a newer push.
+    concurrency:
+      group: db-sync-main
+      cancel-in-progress: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26
+          cache: npm
+
+      - name: Pin npm
+        run: npm install -g npm@11
+
+      - run: npm ci
+
+      # Order matters: the backfill brings older documents up to the current
+      # shape, and only then can the unique `username` index be built over
+      # them. Running the index sync first fails with a duplicate null key.
+      - name: Migrate
+        run: npm run db:migrate
+        env:
+          MONGODB_URI: ${{ secrets.MONGODB_URI }}
