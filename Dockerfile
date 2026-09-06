@@ -10,20 +10,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     && rm -rf /var/lib/apt/lists/*
 
-# Pin npm 11 to match lockfile format
 RUN npm install -g npm@11
 
 WORKDIR /app
 
 COPY package*.json ./
-
-RUN npm ci
+# Use BuildKit cache mount to preserve downloaded tarballs across runs
+RUN --mount=type=cache,target=/root/.npm npm ci
 
 COPY tsconfig.json ./
 COPY src/ ./src/
 
 RUN npm run build
-
 RUN npm prune --omit=dev
 
 # ---------------------------------------------------------------------------
@@ -35,6 +33,7 @@ WORKDIR /app
 
 ENV NODE_ENV=production
 
+# Run as non-root user
 USER node
 
 COPY --chown=node:node --from=builder /app/node_modules ./node_modules
