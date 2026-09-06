@@ -6,6 +6,13 @@ services:
       - mongodb_data:/data/db
     networks:
       - app-net
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '1.5'
+          memory: 1024M
     healthcheck:
       test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
       interval: 10s
@@ -33,6 +40,7 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     init: true
+    stop_grace_period: 15s
     ports:
       - "3000:3000"
     env_file:
@@ -42,6 +50,13 @@ services:
       - MONGODB_URI=mongodb://mongodb:27017/invitations
     networks:
       - app-net
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
     depends_on:
       mongodb:
         condition: service_healthy
