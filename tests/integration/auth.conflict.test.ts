@@ -1,7 +1,7 @@
-import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { FastifyInstance } from 'fastify';
 import { buildApp } from '../../src/app';
-import { setupTestDatabase, teardownTestDatabase, clearDatabase } from '../helpers/setup';
+import { setupTestDatabase, teardownTestDatabase } from '../helpers/setup';
 
 describe('Auth Conflict & Unique Constraint Handling', () => {
   let app: FastifyInstance;
@@ -15,10 +15,6 @@ describe('Auth Conflict & Unique Constraint Handling', () => {
   afterAll(async () => {
     await app.close();
     await teardownTestDatabase();
-  });
-
-  beforeEach(async () => {
-    await clearDatabase();
   });
 
   it('returns HTTP 409 when registering an identical username', async () => {
