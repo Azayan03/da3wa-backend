@@ -1,107 +1,221 @@
-name: CI
+name: CI/CD Pipeline
 
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
-# A newer push to main supersedes an in-flight run for the same branch.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-jobs:
-  test:
-    name: Tests
-    runs-on: ubuntu-latest
+env:
+  NODE_VERSION: '22'
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
 
-    # Escape hatch: put [skip-tests] anywhere in a commit message and this job
-    # is skipped. `head_commit` covers squash- and merge-commit messages;
-    # `commits.*.message` covers every individual commit carried by the push,
-    # so the marker works wherever it was written. Manual runs always test.
+jobs:
+  # =========================================================================
+  # STAGE 1: LINT & STATIC ANALYSIS (Fail-Fast Boundary)
+  # =========================================================================
+  lint:
+    name: Lint & Typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js runtime
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Pin deterministic npm engine
+        run: npm install -g npm@11
+
+      - name: Install dependencies strictly
+        run: npm ci
+
+      - name: Static typecheck & compilation verification
+        run: npm run build
+
+  # =========================================================================
+  # STAGE 2: AUTOMATED TESTING (Dynamic Verification)
+  # =========================================================================
+  test:
+    name: Unit & Integration Tests
+    needs: lint
+    runs-on: ubuntu-latest
     if: >-
       github.event_name != 'push' ||
       ( !contains(github.event.head_commit.message, '[skip-tests]') &&
         !contains(join(github.event.commits.*.message, ' '), '[skip-tests]') )
-
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      # Node 26 matches local development and, crucially, ships npm 11 — the
-      # npm major that generated package-lock.json. npm 10 (bundled with Node
-      # 22) resolves mongodb's unsatisfiable optional peer dep on
-      # gcp-metadata@^7 differently and rejects the lockfile as out of sync.
-      - uses: actions/setup-node@v4
+      - name: Setup Node.js runtime
+        uses: actions/setup-node@v4
         with:
-          node-version: 26
+          node-version: ${{ env.NODE_VERSION }}
           cache: npm
 
-      # Belt and braces: don't leave the npm major to whatever the Node release
-      # happens to bundle, since that is what broke `npm ci` before.
-      - name: Pin npm
+      - name: Pin deterministic npm engine
         run: npm install -g npm@11
 
-      # mongodb-memory-server downloads a mongod binary on first use; caching it
-      # keeps every run after the first from re-fetching ~100MB.
-      - name: Cache MongoDB binaries
+      - name: Restore/Persist MongoDB test binaries
         uses: actions/cache@v4
         with:
-          path: ~/.cache/mongodb-binaries
+          path: /tmp/mongodb-binaries
           key: mongodb-binaries-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
           restore-keys: mongodb-binaries-${{ runner.os }}-
 
-      - run: npm ci
+      - name: Install dependencies strictly
+        run: npm ci
 
-      - name: Typecheck
-        run: npm run build
-
-      - name: Test
+      - name: Execute Vitest test suite
         run: npm test
-        # The suite supplies its own env via tests/helpers/setup.ts and runs
-        # MongoDB in memory, so no secrets are needed here.
         env:
           NODE_ENV: test
+          MONGOMS_DOWNLOAD_DIR: /tmp/mongodb-binaries
 
+  # =========================================================================
+  # STAGE 3: SECURITY SCANNING (Static & Supply Chain Security)
+  # =========================================================================
+  scan:
+    name: Security & Vulnerability Scanning
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js runtime
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Pin deterministic npm engine
+        run: npm install -g npm@11
+
+      - name: Install dependencies strictly
+        run: npm ci
+
+      - name: Software Composition Analysis (SCA - npm audit)
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Secret scanning (detect hardcoded tokens/credentials)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # =========================================================================
+  # STAGE 4: BUILD & SMOKE TEST (Artifact Packaging)
+  # =========================================================================
+  build:
+    name: Container Build & Smoke Test
+    needs: [test, scan]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract Docker metadata & tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=sha-,format=short
+
+      - name: Build and verify container image (with BuildKit cache)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          load: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Execute containerized migration and health smoke test
+        run: |
+          docker compose up -d --build
+          
+          # Poll until the API container reports healthy via Docker healthcheck
+          for i in {1..20}; do
+            STATUS=$(docker compose ps api --format '{{.Health}}')
+            if [ "$STATUS" = "healthy" ]; then
+              echo "API is healthy!"
+              break
+            fi
+            echo "Waiting for API healthcheck... ($i/20)"
+            sleep 2
+          done
+          
+          # Verify HTTP response
+          curl -f http://localhost:3000/api/v1/health
+          docker compose down -v
+
+      - name: Authenticate to GitHub Container Registry (GHCR)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push immutable image artifact
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+
+  # =========================================================================
+  # POST-DEPLOYMENT / STATE SYNC: DATABASE MIGRATION
+  # =========================================================================
   db-sync:
     name: Migrate Atlas
-    needs: test
+    needs: build
     runs-on: ubuntu-latest
-
-    # Only main, and never on top of a red build. `always()` is what lets a
-    # [skip-tests] push through: `needs` alone would skip this job whenever the
-    # test job was skipped, so the two outcomes are spelled out instead.
-    if: >-
-      github.ref == 'refs/heads/main' &&
-      always() &&
-      ( needs.test.result == 'success' || needs.test.result == 'skipped' )
-
-    # Named so the cluster credential can be scoped to it, and optionally put
-    # behind a required reviewer in the repo's environment settings.
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     environment: production
-
-    # Deliberately not part of the CI concurrency group above: a schema sync
-    # must never be cancelled halfway through by a newer push.
     concurrency:
       group: db-sync-main
       cancel-in-progress: false
-
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
+      - name: Setup Node.js runtime
+        uses: actions/setup-node@v4
         with:
-          node-version: 26
+          node-version: ${{ env.NODE_VERSION }}
           cache: npm
 
-      - name: Pin npm
+      - name: Pin deterministic npm engine
         run: npm install -g npm@11
 
-      - run: npm ci
+      - name: Install dependencies strictly
+        run: npm ci
 
-      # Order matters: the backfill brings older documents up to the current
-      # shape, and only then can the unique `username` index be built over
-      # them. Running the index sync first fails with a duplicate null key.
-      - name: Migrate
+      - name: Run forward-only schema backfill and index reconciliation
         run: npm run db:migrate
         env:
           MONGODB_URI: ${{ secrets.MONGODB_URI }}
